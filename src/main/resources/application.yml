@@ -1,0 +1,100 @@
+spring:
+  application:
+    name: mini-doodle
+  datasource:
+    url: jdbc:postgresql://localhost:5432/minidoodle
+    username: minidoodle
+    password: minidoodle
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+      pool-name: MiniDoodleHikariPool
+  jpa:
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        jdbc:
+          batch_size: 50
+          order_inserts: true
+          order_updates: true
+          time_zone: UTC
+        query:
+          in_clause_parameter_padding: true
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 2000
+  cache:
+    type: redis
+    redis:
+      time-to-live: 60000  # 1 minute default TTL
+      cache-null-values: false
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    time-zone: UTC
+
+server:
+  port: 8080
+  compression:
+    enabled: true
+    mime-types: application/json
+  tomcat:
+    threads:
+      max: 200
+      min-spare: 10
+    accept-count: 100
+    max-connections: 8192
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+    tags:
+      application: ${spring.application.name}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    root: INFO
+    com.minidoodle: DEBUG
+    org.hibernate.SQL: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [%X{traceId:-},%X{spanId:-}] %logger{36} - %msg%n"
+
+app:
+  slots:
+    min-duration-minutes: 5
+    max-duration-minutes: 480       # 8 hours
+    max-future-days: 365            # cannot schedule beyond 1 year
+    max-page-size: 200
+  aggregate:
+    cache-ttl-seconds: 30
