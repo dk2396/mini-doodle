@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: minidoodle-postgres
+    environment:
+      POSTGRES_DB: minidoodle
+      POSTGRES_USER: minidoodle
+      POSTGRES_PASSWORD: minidoodle
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U minidoodle -d minidoodle"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - minidoodle-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: minidoodle-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - redis_data:/data
+    networks:
+      - minidoodle-net
+
+  app:
+    build: .
+    container_name: minidoodle-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/minidoodle
+      SPRING_DATASOURCE_USERNAME: minidoodle
+      SPRING_DATASOURCE_PASSWORD: minidoodle
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+    ports:
+      - "8080:8080"
+    networks:
+      - minidoodle-net
+
+  # Optional: Prometheus for metrics scraping (commented for lighter local runs)
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   container_name: minidoodle-prometheus
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  #   networks:
+  #     - minidoodle-net
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  minidoodle-net:
+    driver: bridge
