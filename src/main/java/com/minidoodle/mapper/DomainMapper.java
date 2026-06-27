@@ -1,6 +1,7 @@
 package com.minidoodle.mapper;
 
 import com.minidoodle.domain.Meeting;
+import com.minidoodle.domain.MeetingParticipant;
 import com.minidoodle.domain.Slot;
 import com.minidoodle.domain.User;
 import com.minidoodle.dto.response.MeetingResponse;
@@ -11,7 +12,10 @@ import org.mapstruct.Mapping;
 import org.mapstruct.Named;
 import org.mapstruct.factory.Mappers;
 
-import java.util.Set;
+import java.time.Instant;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Mapper(componentModel = "spring")
@@ -26,19 +30,49 @@ public interface DomainMapper {
     @Mapping(target = "meetingId", source = "meeting.id")
     SlotResponse toSlotResponse(Slot slot);
 
-    @Mapping(target = "slotId",       source = "slot.id")
-    @Mapping(target = "organizerId",  source = "organizer.id")
-    @Mapping(target = "startTime",    source = "slot.startTime")
-    @Mapping(target = "endTime",      source = "slot.endTime")
-    @Mapping(target = "participants", source = "participants", qualifiedByName = "mapParticipants")
-    MeetingResponse toMeetingResponse(Meeting meeting);
 
-    @Named("mapParticipants")
-    default Set<MeetingResponse.ParticipantResponse> mapParticipants(
-            Set<com.minidoodle.domain.MeetingParticipant> ps) {
-        if (ps == null) return Set.of();
-        return ps.stream()
-                .map(p -> new MeetingResponse.ParticipantResponse(p.getUser().getId(), p.getResponseStatus().name()))
-                .collect(Collectors.toSet());
+    default MeetingResponse toMeetingResponse(Meeting meeting) {
+        if (meeting == null) return null;
+
+        // All slots share the same time range; pick any deterministically.
+        Slot anySlot = meeting.getSlots().stream()
+                .min(Comparator.comparing(Slot::getId))
+                .orElse(null);
+        Instant start = anySlot != null ? anySlot.getStartTime() : null;
+        Instant end   = anySlot != null ? anySlot.getEndTime()   : null;
+
+        Long organizerId = meeting.getOrganizer().getId();
+
+        // user_id -> slot_id, so we can pair participants with their slot.
+        Map<Long, Long> slotByUser = meeting.getSlots().stream()
+                .collect(Collectors.toMap(
+                        s -> s.getCalendar().getUser().getId(),
+                        Slot::getId,
+                        (a, b) -> a));
+
+        List<MeetingResponse.AttendeeResponse> attendees = meeting.getParticipants().stream()
+                .sorted(Comparator
+                        .comparing((MeetingParticipant p) -> !p.getUser().getId().equals(organizerId))
+                        .thenComparing(p -> p.getUser().getId()))
+                .map(p -> new MeetingResponse.AttendeeResponse(
+                        p.getUser().getId(),
+                        slotByUser.get(p.getUser().getId()),
+                        p.getResponseStatus().name()))
+                .toList();
+
+        return new MeetingResponse(
+                meeting.getId(),
+                organizerId,
+                meeting.getTitle(),
+                meeting.getDescription(),
+                start,
+                end,
+                attendees,
+                meeting.getCreatedAt()
+        );
     }
+
+    // Unused but kept for explicit MapStruct registration of the participant type
+    @Named("noOp")
+    default MeetingParticipant noOp(MeetingParticipant p) { return p; }
 }

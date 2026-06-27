@@ -9,7 +9,8 @@ import java.time.Instant;
 @Entity
 @Table(name = "slots", indexes = {
         @Index(name = "idx_slots_calendar_time", columnList = "calendar_id,start_time,end_time"),
-        @Index(name = "idx_slots_status", columnList = "status")
+        @Index(name = "idx_slots_status", columnList = "status"),
+        @Index(name = "idx_slots_meeting", columnList = "meeting_id")
 })
 @Getter
 @Setter
@@ -36,7 +37,9 @@ public class Slot extends BaseEntity {
     @Column(nullable = false, length = 16)
     private SlotStatus status;
 
-    @OneToOne(mappedBy = "slot", fetch = FetchType.LAZY, cascade = CascadeType.ALL, orphanRemoval = true)
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "meeting_id")
     private Meeting meeting;
 
     public Duration getDuration() {
@@ -44,7 +47,6 @@ public class Slot extends BaseEntity {
     }
 
     public boolean overlaps(Instant otherStart, Instant otherEnd) {
-        // [startTime, endTime) overlaps [otherStart, otherEnd)
         return startTime.isBefore(otherEnd) && otherStart.isBefore(endTime);
     }
 

@@ -204,7 +204,7 @@ public class SlotService {
     }
 
     private void ensureBatchNonOverlapping(List<CreateSlotRequest> batch) {
-        // O(n log n) check that the batch is internally consistent before the DB rejects it.
+
         List<CreateSlotRequest> sorted = batch.stream()
                 .sorted((a, b) -> a.startTime().compareTo(b.startTime()))
                 .toList();

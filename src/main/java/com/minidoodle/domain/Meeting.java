@@ -19,9 +19,10 @@ public class Meeting extends BaseEntity {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @OneToOne(fetch = FetchType.LAZY, optional = false)
-    @JoinColumn(name = "slot_id", nullable = false, unique = true)
-    private Slot slot;
+
+    @OneToMany(mappedBy = "meeting", fetch = FetchType.LAZY)
+    @Builder.Default
+    private Set<Slot> slots = new HashSet<>();
 
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "organizer_id", nullable = false)
@@ -37,11 +38,17 @@ public class Meeting extends BaseEntity {
     @Builder.Default
     private Set<MeetingParticipant> participants = new HashSet<>();
 
-    public void addParticipant(User user) {
+
+    public void addSlot(Slot slot) {
+        slot.setMeeting(this);
+        slots.add(slot);
+    }
+
+    public void addParticipant(User user, MeetingParticipant.ResponseStatus status) {
         MeetingParticipant p = MeetingParticipant.builder()
                 .meeting(this)
                 .user(user)
-                .responseStatus(MeetingParticipant.ResponseStatus.PENDING)
+                .responseStatus(status)
                 .build();
         participants.add(p);
     }

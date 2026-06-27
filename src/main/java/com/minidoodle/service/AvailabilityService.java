@@ -46,7 +46,7 @@ public class AvailabilityService {
      */
     @Timed("minidoodle.availability.aggregate")
     // Records auto-generate a unique, stable toString() that includes every field.
-    // Use it as the cache key so different requests can never collide.
+    // Using it as the cache key so different requests can never collide.
     @Cacheable(value = CacheConfig.CACHE_AVAILABILITY, key = "#req.toString()")
     @Transactional(readOnly = true)
     public AggregateAvailabilityResponse aggregate(AggregateAvailabilityRequest req) {

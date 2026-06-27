@@ -43,6 +43,10 @@ class EndToEndIntegrationTest extends PostgresIntegrationTest {
         Instant end = minute(90);
         SlotResponse slot = createSlot(organizer.id(), start, end);
 
+        // Under Model B, the participant must also have advertised a matching
+        // FREE slot before they can be invited.
+        createSlot(participant.id(), start, end);
+
         assertThat(slot.status()).isEqualTo(SlotStatus.FREE);
         assertThat(slot.meetingId()).isNull();
 
@@ -57,7 +61,14 @@ class EndToEndIntegrationTest extends PostgresIntegrationTest {
                 .andReturn();
         MeetingResponse meeting = om.readValue(mr.getResponse().getContentAsString(), MeetingResponse.class);
 
-        assertThat(meeting.participants()).hasSize(2); // organizer auto-added
+        assertThat(meeting.attendees()).hasSize(2); // organizer auto-added
+        // Organizer is auto-accepted; invitees stay pending until they respond.
+        assertThat(meeting.attendees().stream()
+                .filter(a -> a.userId().equals(organizer.id())).findFirst().orElseThrow()
+                .responseStatus()).isEqualTo("ACCEPTED");
+        assertThat(meeting.attendees().stream()
+                .filter(a -> a.userId().equals(participant.id())).findFirst().orElseThrow()
+                .responseStatus()).isEqualTo("PENDING");
 
         // Verify slot is now BUSY
         mvc.perform(get("/api/v1/slots/" + slot.id()))
@@ -104,7 +115,7 @@ class EndToEndIntegrationTest extends PostgresIntegrationTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(om.writeValueAsString(
                                 new CreateSlotRequest(start.minus(15, ChronoUnit.MINUTES),
-                                                      start.plus(15, ChronoUnit.MINUTES), null))))
+                                        start.plus(15, ChronoUnit.MINUTES), null))))
                 .andExpect(status().isConflict());
 
         // adjacent (touching boundaries) is allowed - half-open ranges

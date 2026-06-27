@@ -12,9 +12,8 @@ import java.util.Optional;
 @Repository
 public interface MeetingRepository extends JpaRepository<Meeting, Long> {
 
-    @EntityGraph(attributePaths = {"slot", "participants", "participants.user", "organizer"})
+
+    @EntityGraph(attributePaths = {"organizer", "slots", "participants", "participants.user"})
     @Query("SELECT m FROM Meeting m WHERE m.id = :id")
     Optional<Meeting> findByIdWithDetails(@Param("id") Long id);
-
-    Optional<Meeting> findBySlotId(Long slotId);
 }

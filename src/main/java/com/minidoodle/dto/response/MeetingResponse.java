@@ -1,18 +1,22 @@
 package com.minidoodle.dto.response;
 
 import java.time.Instant;
-import java.util.Set;
+import java.util.List;
 
 public record MeetingResponse(
         Long id,
-        Long slotId,
         Long organizerId,
         String title,
         String description,
         Instant startTime,
         Instant endTime,
-        Set<ParticipantResponse> participants,
+        List<AttendeeResponse> attendees,
         Instant createdAt
 ) {
-    public record ParticipantResponse(Long userId, String responseStatus) {}
+
+    public record AttendeeResponse(
+            Long userId,
+            Long slotId,
+            String responseStatus
+    ) {}
 }
