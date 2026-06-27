@@ -1,37 +1,46 @@
 # Design & Trade-offs
 
-This document captures the design decisions behind Mini Doodle, the trade-offs each one carries, and the alternatives that were considered and rejected. The goal of the challenge is to surface design and tech decision-making, so this is the file to read for that.
+This document explains the decisions behind Mini Doodle. The brief says the goal is to surface design judgement, so this is the file to read for that.
 
 ---
 
-## 1. Goals and non-goals
+## Headline decisions
 
-**Goals**
+1. **No-overlap is a database invariant**, not an application check — Postgres `EXCLUDE` constraint on `tstzrange` per calendar.
+2. **Default-unavailable booking** ("Doodle-style"): invitees must have advertised a matching FREE slot to be bookable.
+3. **Multi-attendee slot binding** (V2): a meeting binds N slots, one per attendee, via `slots.meeting_id`. Aggregate availability returns the truth for invitees.
+4. **Layered concurrency control**: DB exclusion + pessimistic row lock on state transitions + optimistic `@Version` on edits.
+5. **Half-open `[start, end)` ranges** everywhere — matches iCalendar/Google/Outlook.
 
-- Correctness first: it must be impossible to create overlapping slots or double-book a slot, even under concurrency.
-- Scale to "hundreds of users, thousands of slots" comfortably, with a clear path to scale 10–100× further without rewriting the data model.
-- Operability: clean error responses, observability hooks, deterministic schema migrations, container-native runtime.
-- Production-grade code structure: layered, testable, no leaked persistence concerns above the service layer.
-
-**Non-goals** (out of scope for this exercise, but signposted)
-
-- AuthN/AuthZ. Every endpoint is open — adding Spring Security with JWT + per-user authorization is a follow-up.
-- Notifications, ICS export, recurrence rules. Recurrence in particular has substantial design implications (RRULE expansion vs. materialization) and would dwarf the rest.
-- Multi-region deployment, leader-elected workers, cross-region replication.
+The rest of the doc explains *why* each one, what it trades away, and where the boundaries are. There's an honest "what I'd do differently" section at the end.
 
 ---
 
-## 2. The single most important decision: enforce "no overlap" in the database
+## 1. Scope
 
-The strongest invariant in a scheduling system is *no two slots overlap inside the same calendar*. Almost every bug class in this kind of system traces back to a missing or partial enforcement of that invariant. There are essentially three places to enforce it:
+**In scope:** slot CRUD, slot → meeting conversion, free/busy aggregation, V1 + V2 migration with a real schema evolution, integration tests against a real Postgres.
 
-| Where        | Strength                                                       | Cost                                              |
-|--------------|----------------------------------------------------------------|---------------------------------------------------|
-| Application  | Weakest — TOCTOU race between the `SELECT` and the `INSERT`    | Cheapest, easiest to reason about                 |
-| Distributed lock (e.g. Redis Redlock per user) | Strong, but introduces a new fault domain | Adds infrastructure dependency on the write path; tricky reentrancy/expiry semantics |
-| **Database (chosen)** | Strongest — the invariant is impossible to violate, regardless of process count, restart timing, or partial failures | Locked to PostgreSQL features (`btree_gist`, `EXCLUDE`) |
+**Out of scope** (and why):
 
-The migration uses a GIST exclusion constraint:
+- **Auth.** Endpoints are open; the user model is ready for an `owner_id` audit field. Real auth = follow-up.
+- **Participant response endpoint.** `MeetingParticipant.responseStatus` is set correctly at booking (organizer = ACCEPTED, invitees = PENDING), but there's no `PATCH` to change it. State machine sketched in code; endpoint deferred.
+- **Notifications, ICS export, recurrence.** Recurrence in particular is its own design exercise (RRULE expansion vs. materialization).
+- **Soft delete & audit trail.** Hard-delete now. Production would soft-delete and emit audit events.
+- **Multi-region, distributed deployment.**
+
+---
+
+## 2. The core invariant: no overlap, enforced by the database
+
+The strongest invariant in a scheduling system is *no two slots overlap inside the same calendar*. Three places to enforce it:
+
+| Where | Strength | Cost |
+|---|---|---|
+| Application | Weakest — TOCTOU race between SELECT and INSERT | Cheapest |
+| Distributed lock | Strong, but a new fault domain | Infra dependency on the write path |
+| **Database (chosen)** | Strongest — impossible to violate regardless of process count or partial failures | Locked to Postgres |
+
+The constraint:
 
 ```sql
 CONSTRAINT slot_no_overlap EXCLUDE USING gist (
@@ -40,157 +49,86 @@ CONSTRAINT slot_no_overlap EXCLUDE USING gist (
 )
 ```
 
-**Why twe used it here**
+The application keeps an `existsOverlapping` pre-check so the common case returns a clean 409 with a clear message, but it is *not* the source of truth — the DB constraint is. The `GlobalExceptionHandler` catches the Postgres violation by constraint name and translates it to 409.
 
-- Application checks alone are unsafe under any concurrency: two pods, two threads in one pod, or even one thread with a slow network can interleave `SELECT exists_overlap` and `INSERT` and produce overlap. We could close that with `SERIALIZABLE` + retry, but per-calendar exclusion is cheaper, deadlock-free, and self-documenting.
-- We still keep an application-level pre-check (`existsOverlapping`) so the common case returns `409 Conflict` with a clean message, instead of bubbling a raw `DataIntegrityViolationException`. The DB constraint is the safety net that catches races; the application check is the UX.
+**Trade-off**: vendor lock-in on Postgres. The alternatives are either much more code (`SERIALIZABLE` + retry) or a new infra dependency (distributed lock), both worse than coupling to a feature Postgres has had since 9.0.
 
-**Trade-offs accepted**
-
-- **Vendor lock-in on Postgres.** Worth it — the alternatives are more code, more bugs, and no equivalent in MySQL/MariaDB that doesn't itself rely on locks.
-- **Constraint exceptions come as `DataIntegrityViolationException`.** The global handler inspects the message for `slot_no_overlap` and returns 409. Inspecting messages is mildly fragile, but the constraint name is in our own migration so it's stable.
+This single constraint transitively covers the entire correctness story for the slot table: no two FREE slots overlap (you can't be free twice at once), no two BUSY slots overlap (you can't be in two meetings at once), no FREE/BUSY overlap. Combined with V2's `UNIQUE (meeting_id, calendar_id)`, a single meeting also can't have two slots on the same calendar.
 
 ---
 
-With the strict "invitees must advertise availability" rule, the EXCLUDE constraint guards three distinct races: two organizers creating overlapping slots on the same calendar, 
-two organizers concurrently claiming the same FREE slot for different meetings (the FREE → BUSY transition under SELECT … FOR UPDATE plus the unique (meeting_id, calendar_id) from V2 makes the second one fail), 
-and the soft case of an invitee being booked into multiple non-matching meetings. The application-level "exact match" check is a UX layer over these DB-level guarantees.
+## 3. Booking semantics: default-unavailable (Model B)
 
-## 3. Time range semantics: half-open `[start, end)`
+Two valid product shapes for a calendar:
 
-`09:00–10:00` and `10:00–11:00` do **not** overlap. This is the unambiguous convention in every serious calendar system (Outlook, Google Calendar, iCalendar `DTEND` is exclusive). The DB range literal `tstzrange(start, end, '[)')` makes this an explicit, queryable property. All overlap checks in the service layer use the same convention.
+- **Default-available** (Outlook, Google): users are bookable at any time unless explicitly blocked.
+- **Default-unavailable** (Doodle, Calendly): users are bookable only at times they have explicitly advertised as FREE.
 
-**Trade-off**: a "what slot covers exactly this instant" query needs `start <= t < end`, not `start <= t <= end`. The code does this consistently; it's the kind of thing that needs to be picked once and used everywhere.
+We chose default-unavailable because the brief literally says *"users define available slots which can later be converted into meetings"* and the product is called *"mini Doodle"*. Both rule out the Outlook model.
+
+Concretely:
+- Organizer pre-creates a FREE slot. Invitees must also have a FREE slot at the **exact** time before they can be invited.
+- Booking claims everyone's matching FREE slot (FREE → BUSY) and binds them all to the same meeting via `slots.meeting_id`.
+- No matching slot → 409 with a message naming the user and the time range.
+- Cancellation returns every bound slot to FREE — nothing is deleted. Each calendar reverts to exactly what it looked like before the booking.
+
+**What we explicitly do not do**: split FREE slots. If an invitee has FREE 09:00–10:00 and the meeting is 09:00–09:30, the booking fails. Slot splitting is meaningful UX but it's its own design exercise (timezones, recurring slots) and out of scope.
+
+**Trade-off**: stricter contract than Outlook — a user who has done nothing in the system cannot be invited. Correct for Doodle, wrong for a corporate calendar. A future default-available mode is a per-calendar setting away; the data model accommodates it (drop the exact-match requirement in `MeetingService`).
 
 ---
 
 ## 4. Concurrency model
 
-There are two distinct concurrency hazards.
+Three distinct hazards, three defenses.
 
-### 4a. Overlapping slot creation
-Two concurrent requests trying to create slots that overlap each other in the same calendar.
-- **Defense**: the GIST `EXCLUDE` constraint. Postgres will block the second writer until the first commits, then reject it. We don't need application-side locks.
-- **Verified** by `ConcurrencyIntegrationTest.concurrentOverlappingSlotCreationsResultInExactlyOneSurvivor`.
+**Slot creation overlap.** Two writes that would create overlapping slots in the same calendar. Defended by the GIST `EXCLUDE` constraint (§2). Verified by `ConcurrencyIntegrationTest.concurrentOverlappingSlotCreationsResultInExactlyOneSurvivor`.
 
-### 4b. Double-booking a slot into two meetings
-Two concurrent requests trying to convert the same FREE slot into a meeting.
-- **Defense (primary)**: pessimistic row lock (SELECT ... FOR UPDATE) on the slot during booking. The second writer sees status=BUSY after the first commits and returns a clean 409.
-- **Defense (secondary)**: the V2 UNIQUE (meeting_id, calendar_id) constraint on slots. Even if the row lock were absent, a slot can only be bound to one meeting per calendar.
-- **Verified** by `ConcurrencyIntegrationTest.onlyOneOfNConcurrentBookingsOnTheSameSlotSucceeds`.
+**Double-booking the same slot.** Two writes trying to bind the same FREE slot to different meetings. Pessimistic `SELECT FOR UPDATE` on the slot row during booking serializes them at the DB; the second writer sees `status=BUSY` after the first commits and returns 409. V2's `UNIQUE (meeting_id, calendar_id)` is the secondary defense. Verified by `ConcurrencyIntegrationTest.onlyOneOfNConcurrentBookingsOnTheSameSlotSucceeds`.
 
-### 4c. Concurrent edits to an unbooked slot
-Two concurrent `PATCH` requests on the same slot.
-- **Defense**: `@Version` optimistic locking. The second writer gets `OptimisticLockingFailureException` → 409. We do **not** hold pessimistic locks across the request boundary for updates of FREE slots — that would be a footgun for hot calendars.
+**Concurrent edits.** Two `PATCH` requests on the same slot. JPA `@Version` optimistic locking; the loser gets `OptimisticLockingFailureException` → 409. No pessimistic lock here, because hot calendars would suffer.
 
-### Trade-offs
-- We mix optimistic (`@Version`) and pessimistic (`SELECT FOR UPDATE`) locking on the same table. This is intentional — pessimistic is reserved for the narrow case where we need the application to see the latest state to enforce a transition rule (FREE → booked), and optimistic for everything else. The cost is a slightly larger mental model.
-- The pessimistic lock on a single slot row scopes contention to that row; it doesn't hot-spot the table.
+**Trade-off**: mixing optimistic and pessimistic locking on the same table is intentional but adds mental overhead. The split: pessimistic for state transitions (FREE → BUSY), optimistic for everything else.
 
 ---
 
-## 5. Performance and scaling
+## 5. Half-open `[start, end)` ranges
 
-### Indexes
-- **`(calendar_id, start_time, end_time)`** btree — the workhorse for "give me a user's slots in `[from, to)`".
-- **GIST on `tstzrange(start_time, end_time, '[)')`** — used by the EXCLUDE constraint *and* available for range overlap queries.
-- **`(status)`** btree — supports filtered listings; low cardinality but useful when ranged-restricted result sets are already small.
-
-### Query shape
-The aggregate-availability path uses a single `IN (...)` query bounded by the input user set, then groups in Java. Alternative considered: one query per user. Rejected — N+1 over the HTTP boundary is worth more than the index lookup we'd save.
-
-### Hibernate batch inserts
-`spring.jpa.properties.hibernate.jdbc.batch_size=50` plus `order_inserts=true` and `order_updates=true` give us proper JDBC batching on bulk creates. The bulk endpoint caps at 500 to keep a single transaction bounded.
-
-### Read caching
-Aggregate availability is cached in Redis with a short TTL (30s default) and the cache key is derived from the full request. Any write (create/update/delete on slots, meetings book/cancel) blanket-evicts the cache via `@CacheEvict(allEntries=true)`. The trade-off here is real:
-
-- **Pro**: handles the hot read path (the question "who is free?" is the headline feature of a Doodle-like product).
-- **Con**: a single write evicts everything, which is fine at low write-volume but would need refinement at scale (per-user keys, surgical invalidation, or simply removing the cache and trusting the DB) once writes get bursty.
-
-### Connection pool
-HikariCP at 20 connections, sized for moderate parallelism. The Postgres ceiling on `max_connections` is the relevant cap further down — at scale, pgBouncer in transaction-pooling mode in front of the DB is the standard move.
-
-### What we'd reach for next (path to 100×)
-
-1. **Read replicas**. Spring's `LazyConnectionDataSourceProxy` + `@Transactional(readOnly=true)` routing gets reads off the primary.
-2. **pgBouncer** for connection multiplexing.
-3. **Sharding by `calendar_id`**. Every relevant index already includes `calendar_id` first, and there is no global query that crosses calendars besides aggregate-availability — which is itself naturally batchable per shard.
-4. **Outbox + Kafka** for the "meeting created/cancelled" event stream once notifications and audit are in scope.
+`09:00–10:00` and `10:00–11:00` do **not** overlap. Convention in every serious calendar system (iCalendar's `DTEND` is exclusive; Outlook and Google both follow). The DB literal `tstzrange(start, end, '[)')` makes the convention explicit and queryable. All overlap checks in the service layer use the same shape.
 
 ---
 
-## 6. Booking semantics: default-unavailable
+## 6. Performance and scaling
 
-Two valid product models for a calendar:
-- Default-available (Outlook/Google): users are bookable at any time unless explicitly blocked. Invitations are aspirational — recipients decline if busy.
-- Default-unavailable (Doodle/Calendly): users are bookable only at times they have explicitly advertised as FREE. Invitations to unadvertised times are rejected outright.
-- We chose Model B because the brief literally says "users define available slots which can later be converted into meetings"
+At the stated load — hundreds of users, thousands of slots — Postgres on a laptop handles it without breaking a sweat. The indexes that matter:
 
-Concretely:
+- `(calendar_id, start_time, end_time)` btree for the workhorse range query.
+- GIST on `tstzrange(start_time, end_time, '[)')`, which backs the `EXCLUDE` constraint and serves overlap queries.
 
-- The organizer pre-creates a FREE slot. Invitees must also have advertised exact-time-match FREE slots before they can be invited.
-- Booking claims everyone's matching FREE slot (FREE → BUSY) and binds them all to the same meeting via slots.meeting_id (V2 schema).
-- If an invitee has no matching slot, the request fails with 409 and the error names the user + time range.
+The aggregate-availability path is a single `IN` query bounded by the input user set, grouped in Java — one DB roundtrip regardless of how many users are requested.
 
-Trade-off: this is a stricter contract than Outlook. A user who has done nothing in the system cannot be invited to a meeting. 
-That's correct for a Doodle-style product but would be wrong for a corporate calendar replacement. 
-A future "default-available" mode could be a per-calendar setting; the data model accommodates it
+A Redis cache sits in front of aggregate availability with a 30s TTL and blanket eviction on write. Honest assessment: overkill at this scale; could be removed without measurable impact. See *What I'd do differently*.
 
-What we explicitly do not do: split FREE slots. If an invitee has FREE 09:00–10:00 and we try to book them 09:00–09:30, the booking fails — we don't carve the slot. 
-Slot splitting is a meaningful UX improvement but is its own design exercise (boundary cases around timezones, recurring slots, etc.) and out of scope here.
+**Path to 10× and 100×**, in order:
+1. Read replicas via `LazyConnectionDataSourceProxy` + `@Transactional(readOnly=true)` routing.
+2. pgBouncer for connection multiplexing.
+3. Shard by `calendar_id` — every relevant index has it as a prefix; no cross-calendar query except aggregate availability, which is naturally batchable per shard.
+4. Outbox + Kafka once notifications and audit are in scope.
 
 ---
 
-## 7. Calendar as a domain concept
+## 7. Operability
 
-The challenge says: *"Calendar as the term in the task should be present only in the domain in the service."* We respect that strictly:
-
-- `Calendar` is a JPA entity. It exists in `com.minidoodle.domain`.
-- No request DTO or response DTO references it.
-- No controller path mentions it.
-- The user owns the calendar (1:1), and we create it eagerly when the user is created — the consumer of the API simply talks about "a user's slots".
-
-The benefit of having the entity at all is that the per-user no-overlap invariant is naturally scoped to a stable foreign key (`calendar_id`), which is what the GIST exclusion constraint needs.
+- **Health and metrics** at `/actuator/health` and `/actuator/prometheus`. Standard Spring Boot wiring.
+- **Structured logs** with `traceId`/`spanId` placeholders ready for OpenTelemetry.
+- **Errors are uniform**: a single `@RestControllerAdvice` translates every domain and persistence exception to an `ErrorResponse` envelope (timestamp, status, error, message, path, optional field errors). The `slot_no_overlap` constraint name is caught by message and translated to 409, not 500.
+- **Migrations are versioned**: V1 = initial schema, V2 = multi-attendee refactor. Applied migrations are immutable.
 
 ---
 
-## 8. Error handling
+## 8. Calendar as a domain concept
 
-A single `GlobalExceptionHandler` translates each domain exception to a standard `ErrorResponse` (timestamp, status, error, message, path, optional field errors). Specifically:
-
-| Exception                                  | HTTP   |
-|-------------------------------------------|--------|
-| `ResourceNotFoundException`                | 404    |
-| `InvalidSlotException`, validation errors  | 400    |
-| `SlotOverlapException`, `ConflictException`, `DuplicateResourceException` | 409 |
-| `OptimisticLockingFailureException`        | 409    |
-| `DataIntegrityViolationException` (caught GIST/unique violations) | 409 |
-| anything else                              | 500    |
-
-Validation field errors include the offending property name so clients can show inline form errors without parsing free text.
+The brief says: *"Calendar as the term in the task should be present only in the domain in the service."* Honored strictly: `Calendar` is a JPA entity, owned 1:1 by each user, and never referenced in any DTO, request path, or controller. The benefit of having it as an entity is that the no-overlap invariant has a stable foreign key (`calendar_id`) to scope on, which is what the GIST `EXCLUDE` needs.
 
 ---
-
-## 9. What is deliberately not in the build
-
-- **Authentication**. The exercise gives no indication of an auth context, so endpoints accept any caller. The user model is ready for an `owner_id` audit field; `AuditorAware` is wired in as a no-op stub.
-- **Rate limiting**. At this scale, Spring's `RateLimiterRegistry` or a sidecar like Envoy would be the move — out of scope for the exercise.
-- **Notifications, ICS, RSVP updates**. The `MeetingParticipant.responseStatus` is in the schema and entity, but there is no endpoint for participants to change it. Adding one is a 30-line patch — left out to keep the surface small.
-- **Soft delete / audit log**. We hard-delete. A real production system would soft-delete meetings and emit audit events; the schema would gain `deleted_at` and a separate `meeting_audit` table.
-- **OpenTelemetry**. The log pattern reserves slots for `traceId`/`spanId` and Micrometer's tracing bridge can be enabled by adding the Boot starter — left as a single dependency add.
-
----
-
-## 10. Summary of the headline trade-offs
-
-| Decision                              | What we gain                                | What we give up                                  |
-|---------------------------------------|---------------------------------------------|--------------------------------------------------|
-| Postgres `EXCLUDE` for overlap        | Bulletproof no-overlap under any concurrency | Portability away from Postgres                   |
-| Default-unavailable (Model B) booking        | clear failure modes     | Stricter than Outlook — users must advertise availability first |
-| Mixed optimistic + pessimistic locking | Right tool for each case                    | Two locking models to keep in mind               |
-| Multi-attendee slot binding (V2)       | Aggregate availability is correct for invitees;                        | N slot rows per meeting; slot table grows with attendee count                 |
-| One synchronous service (no events)   | Lower operational surface                   | No clean extension point for downstream (notifications, etc.) |
-| Hard delete                            | Smaller schema                              | No audit trail for compliance                    |
-| No auth                                | Smaller surface for the exercise            | Not production-ready as-is                       |
 
