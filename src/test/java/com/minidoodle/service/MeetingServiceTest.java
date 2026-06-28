@@ -220,6 +220,8 @@ class MeetingServiceTest {
         when(userRepository.findAllByIdIn(any())).thenReturn(List.of(organizer, invitee));
         when(calendarRepository.findByUserId(2L)).thenReturn(Optional.of(inviteeCalendar));
         when(slotRepository.findExactFreeMatch(eq(20L), any(), any())).thenReturn(Optional.empty());
+        // No partial availability either - calendar empty for this range
+        when(slotRepository.findFreeSlotsInRange(eq(20L), any(), any())).thenReturn(List.of());
         when(meetingRepository.save(any(Meeting.class))).thenAnswer(inv -> {
             Meeting m = inv.getArgument(0); m.setId(999L); return m;
         });
@@ -229,7 +231,37 @@ class MeetingServiceTest {
                 .isInstanceOf(ConflictException.class)
                 .hasMessageContaining("has not advertised availability");
 
-        // No new slots should have been created
+        verify(slotRepository, never()).save(any(Slot.class));
+    }
+
+    @Test
+    void rejectsButReportsPartialAvailabilityWhenInviteeOnlyOverlapsPartially() {
+        // Invitee has a 30-min FREE slot, meeting wants 60 min. Booking still
+        // fails (Model B never silently stretches commitments), but the error
+        // message surfaces the actual free window so the organizer knows what's
+        // possible.
+        Slot partialSlot = Slot.builder()
+                .id(300L).calendar(inviteeCalendar)
+                .startTime(organizerSlot.getStartTime())
+                .endTime(organizerSlot.getStartTime().plus(15, ChronoUnit.MINUTES))
+                .status(SlotStatus.FREE).build();
+
+        when(slotRepository.findByIdForUpdate(100L)).thenReturn(Optional.of(organizerSlot));
+        when(userRepository.findById(1L)).thenReturn(Optional.of(organizer));
+        when(userRepository.findAllByIdIn(any())).thenReturn(List.of(organizer, invitee));
+        when(calendarRepository.findByUserId(2L)).thenReturn(Optional.of(inviteeCalendar));
+        when(slotRepository.findExactFreeMatch(eq(20L), any(), any())).thenReturn(Optional.empty());
+        when(slotRepository.findFreeSlotsInRange(eq(20L), any(), any())).thenReturn(List.of(partialSlot));
+        when(meetingRepository.save(any(Meeting.class))).thenAnswer(inv -> {
+            Meeting m = inv.getArgument(0); m.setId(999L); return m;
+        });
+
+        assertThatThrownBy(() -> service.bookMeeting(100L,
+                new CreateMeetingRequest("Sync", null, 1L, Set.of(2L))))
+                .isInstanceOf(ConflictException.class)
+                .hasMessageContaining("only partially available")
+                .hasMessageContaining("Either shorten the meeting");
+
         verify(slotRepository, never()).save(any(Slot.class));
     }
 

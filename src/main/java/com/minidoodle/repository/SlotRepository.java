@@ -74,4 +74,19 @@ public interface SlotRepository extends JpaRepository<Slot, Long> {
     Optional<Slot> findExactFreeMatch(@Param("calendarId") Long calendarId,
                                       @Param("start") Instant start,
                                       @Param("end") Instant end);
+
+
+
+    @Query("""
+           SELECT s FROM Slot s
+           WHERE s.calendar.id = :calendarId
+             AND s.status      = com.minidoodle.domain.SlotStatus.FREE
+             AND s.meeting IS NULL
+             AND s.startTime   < :end
+             AND s.endTime     > :start
+           ORDER BY s.startTime
+           """)
+    List<Slot> findFreeSlotsInRange(@Param("calendarId") Long calendarId,
+                                    @Param("start") Instant start,
+                                    @Param("end") Instant end);
 }

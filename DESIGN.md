@@ -73,6 +73,8 @@ Concretely:
 - Cancellation returns every bound slot to FREE — nothing is deleted. Each calendar reverts to exactly what it looked like before the booking.
 
 **What we explicitly do not do**: split FREE slots. If an invitee has FREE 09:00–10:00 and the meeting is 09:00–09:30, the booking fails. Slot splitting is meaningful UX but it's its own design exercise (timezones, recurring slots) and out of scope.
+A partial overlap — invitee advertised 15:00–15:30, meeting is 15:00–16:00 — also fails with 409. We don't stretch the invitee's slot (would silently extend their commitment) or split the meeting (would create variable-attendance meetings, a feature in its own right). 
+The invitee must advertise the full range, or the organizer must shorten the meeting.
 
 **Trade-off**: stricter contract than Outlook — a user who has done nothing in the system cannot be invited. Correct for Doodle, wrong for a corporate calendar. A future default-available mode is a per-calendar setting away; the data model accommodates it (drop the exact-match requirement in `MeetingService`).
 

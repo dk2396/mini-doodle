@@ -115,12 +115,18 @@ public class MeetingService {
                 Calendar cal = calendarRepository.findByUserId(uid)
                         .orElseThrow(() -> ResourceNotFoundException.of("Calendar for user", uid));
 
-
+                // Model B (Doodle-style): invitees must have pre-advertised an
+                // EXACT-time-match FREE slot. We do NOT auto-create mirror slots
+                // for users who never marked themselves available at this time.
+                //
+                // When the exact match fails, we still surface any partial
+                // availability the invitee has advertised inside the requested
+                // window. The booking still fails (we don't silently stretch
+                // their commitment), but the organizer learns what's possible
+                // — "shorten the meeting" or "ask the user to extend their
+                // advertised availability" become concrete next steps.
                 slot = slotRepository.findExactFreeMatch(cal.getId(), start, end)
-                        .orElseThrow(() -> new ConflictException(
-                                "User " + uid + " has not advertised availability for "
-                                        + start + " to " + end + ". They must create a FREE slot "
-                                        + "at this time before being invited."));
+                        .orElseThrow(() -> buildAvailabilityConflict(cal.getId(), uid, start, end));
             }
 
             slot.setStatus(SlotStatus.BUSY);
@@ -151,7 +157,10 @@ public class MeetingService {
         Meeting m = meetingRepository.findByIdWithDetails(meetingId)
                 .orElseThrow(() -> ResourceNotFoundException.of("Meeting", meetingId));
 
-
+        // Under Model B every slot bound to the meeting was explicitly created
+        // by its owner (no auto-generated mirrors), so every slot returns to
+        // FREE state - none get deleted. Owners' calendars look exactly as
+        // they did before the meeting was booked.
         List<Slot> slots = new ArrayList<>(m.getSlots());
         for (Slot slot : slots) {
             slot.setMeeting(null);
@@ -159,5 +168,25 @@ public class MeetingService {
         }
         meetingRepository.delete(m);
         log.info("Cancelled meeting id={} freed slots={}", meetingId, slots.size());
+    }
+
+
+    private ConflictException buildAvailabilityConflict(Long calendarId, Long userId,
+                                                        Instant start, Instant end) {
+        List<Slot> partials = slotRepository.findFreeSlotsInRange(calendarId, start, end);
+        if (partials.isEmpty()) {
+            return new ConflictException(
+                    "User " + userId + " has not advertised availability for "
+                            + start + " to " + end + ". They must create a FREE slot "
+                            + "at this exact time before being invited.");
+        }
+        String windows = partials.stream()
+                .map(s -> s.getStartTime() + "–" + s.getEndTime())
+                .collect(Collectors.joining(", "));
+        return new ConflictException(
+                "User " + userId + " is only partially available in "
+                        + start + " to " + end + ". Their FREE windows in this range: "
+                        + windows + ". Either shorten the meeting to match, or ask the "
+                        + "user to advertise the full range.");
     }
 }

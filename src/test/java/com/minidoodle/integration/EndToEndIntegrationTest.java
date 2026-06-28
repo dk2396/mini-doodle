@@ -205,6 +205,26 @@ class EndToEndIntegrationTest extends PostgresIntegrationTest {
                 .andExpect(jsonPath("$.length()").value(3));
     }
 
+    @Test
+    void partialAvailabilityReturns409WithHelpfulMessage() throws Exception {
+        UserResponse organizer = createUser("org-" + System.nanoTime() + "@x.com", "Org");
+        UserResponse invitee   = createUser("inv-" + System.nanoTime() + "@x.com", "Inv");
+
+        Instant start = minute(60);
+        Instant end   = minute(90);
+        SlotResponse orgSlot = createSlot(organizer.id(), start, end);
+        // Invitee advertised only half the meeting window
+        createSlot(invitee.id(), start, start.plus(15, ChronoUnit.MINUTES));
+
+        CreateMeetingRequest req = new CreateMeetingRequest(
+                "Sync", null, organizer.id(), Set.of(invitee.id()));
+        mvc.perform(post("/api/v1/slots/" + orgSlot.id() + "/meetings")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(om.writeValueAsString(req)))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.message",  org.hamcrest.Matchers.containsString("only partially available")));
+    }
+
     // ---- helpers ----
 
     private UserResponse createUser(String email, String name) throws Exception {
@@ -215,6 +235,8 @@ class EndToEndIntegrationTest extends PostgresIntegrationTest {
                 .andReturn();
         return om.readValue(r.getResponse().getContentAsString(), UserResponse.class);
     }
+
+
 
     private SlotResponse createSlot(Long userId, Instant start, Instant end) throws Exception {
         MvcResult r = mvc.perform(post("/api/v1/users/" + userId + "/slots")
